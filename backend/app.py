@@ -22,8 +22,6 @@ app.add_middleware(
 )
 
 
-# --- МОДЕЛІ ДАНИХ ТА ГЛОБАЛЬНІ НАЛАШТУВАННЯ ---
-
 class SettingsModel(BaseModel):
     random_seed: Optional[int] = Field(None, description="Зерно генератора псевдовипадкових чисел")
     img_size: int = Field(200, ge=50, le=1000, description="Розмір сторони квадратного зображення в пікселях")
@@ -35,7 +33,6 @@ class DatasetRequest(BaseModel):
     total_samples: int = Field(..., ge=1, le=5000, description="Кількість пар зразків для генерації")
 
 
-# Стан системи
 system_config = {
     "random_seed": None,
     "img_size": 200,
@@ -43,11 +40,9 @@ system_config = {
 }
 
 
-# --- ДОПОМІЖНІ ФУНКЦІЇ ГЕНЕРАЦІЇ (ВАША ЛОГІКА) ---
-
 def make_masks(img_size: int):
     center = (img_size // 2, img_size // 2)
-    radius = int(img_size * 0.35)  # 70 для розміру 200
+    radius = int(img_size * 0.35)
     y, x = np.ogrid[:img_size, :img_size]
     dist = np.sqrt((x - center[0]) ** 2 + (y - center[1]) ** 2)
     circle_mask = dist <= radius
@@ -100,7 +95,7 @@ def apply_background_noise(img_array, mode, bg_mask, img_size):
         add_random_spots(img_array, bg_mask, count=random.randint(4, 20), radius_range=(1, 4), value=0,
                          img_size=img_size)
     elif mode == 6:
-        add_spots = add_random_spots(img_array, bg_mask, count=random.randint(4, 20), radius_range=(1, 4), value=200,
+       add_random_spots(img_array, bg_mask, count=random.randint(4, 20), radius_range=(1, 4), value=200,
                                      img_size=img_size)
     elif mode == 7:
         img_array[bg_mask] = 200
@@ -156,7 +151,6 @@ def compute_grid_features(template, sample, img_size, grid_cells):
 
 
 def generate_pair_worker(args):
-    """Генерує пару: чистий круг з шумом на фоні (class 0) та той самий зразок з дефектом (class 1)."""
     sample_id, bg_mode, defect_mode, img_size, grid_cells, seed = args
 
     if seed is not None:
@@ -166,19 +160,15 @@ def generate_pair_worker(args):
     circle_mask, bg_mask, center, radius = make_masks(img_size)
     template = get_template(img_size)
 
-    # 1. Створюємо зразок із шумом фону
     sample_clean = template.copy()
     apply_background_noise(sample_clean, bg_mode, bg_mask, img_size)
 
-    # 2. Робимо точну копію та додаємо внутрішній дефект
     sample_defective = sample_clean.copy()
     apply_defect(sample_defective, defect_mode, circle_mask, center, radius, img_size)
 
-    # 3. Витягуємо вектори інтенсивностей клітинок
     features_clean = compute_grid_features(template, sample_clean, img_size, grid_cells)
     features_defective = compute_grid_features(template, sample_defective, img_size, grid_cells)
 
-    # 4. Кодуємо обидва зображення в байти PNG
     buf_clean = io.BytesIO()
     Image.fromarray(sample_clean).save(buf_clean, format="PNG")
     clean_bytes = buf_clean.getvalue()
@@ -203,30 +193,25 @@ def generate_dataset(total_samples: int):
     tasks = []
     sample_id = 0
 
-    # Гарантуємо наявність усіх 56 комбінацій (8 режимів фону x 7 дефектів)
     for bg_mode in range(0, 8):
         for defect_mode in range(1, 8):
             tasks.append((sample_id, bg_mode, defect_mode, img_size, grid_cells, seed))
             sample_id += 1
 
-    # Заповнюємо решту випадковими комбінаціями
     while len(tasks) < total_samples:
-        bg_mode = random.randint(0, 7)  # режими фону від 0 до 7
+        bg_mode = random.randint(0, 7)
         defect_mode = random.randint(1, 7)
         tasks.append((sample_id, bg_mode, defect_mode, img_size, grid_cells, seed))
         sample_id += 1
 
     tasks = tasks[:total_samples]
 
-    # Розпаралелення через Pool (задіяно половину ядер CPU, як у вашому main)
     processes_count = max(1, int(cpu_count() / 2))
     with Pool(processes=processes_count) as pool:
         batch_results = pool.map(generate_pair_worker, tasks)
 
     return batch_results
 
-
-# --- ЕНДПОІНТИ API ---
 
 @app.post("/settings", summary="1. Встановлення налаштувань системи")
 def set_settings(settings: SettingsModel):
@@ -256,7 +241,6 @@ def get_template_endpoint():
     size = system_config["img_size"]
     template_arr = get_template(size)
     buffer = io.BytesIO()
-    # Зберігаємо як чистий бінарний 1-бітний або 8-бітний PNG без компресії артефактів
     Image.fromarray(template_arr).save(buffer, format="PNG", compress_level=0)
 
     return Response(
@@ -273,16 +257,8 @@ def get_template_endpoint():
 def generate_dataset_endpoint(req: DatasetRequest):
     batch_results = generate_dataset(req.total_samples)
 
-    # Пакування всіх файлів у ZIP в пам'яті
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        # Додаємо еталон
-        # template_arr = get_template(system_config["img_size"])
-        # t_buf = io.BytesIO()
-        # Image.fromarray(template_arr).save(t_buf, format="PNG")
-        # zip_file.writestr("template.png", t_buf.getvalue())
-
-        # Додаємо згенеровані пари
         for pair in batch_results:
             for filename, png_bytes, _, _ in pair:
                 zip_file.writestr(filename, png_bytes)
