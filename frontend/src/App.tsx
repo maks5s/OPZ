@@ -9,7 +9,293 @@ type GeneratedImage = {
   src: string
 }
 
+type SystemSettings = {
+  random_seed: number | null
+  img_size: number
+  grid_cells: number
+}
+
+type TrainingSettings = {
+  epochs: number
+  learning_rate: number
+  hidden_layers: 0 | 1
+  hidden_units: number
+}
+
+type PerClassMetrics = {
+  precision: number
+  recall: number
+  f1: number
+  support: number
+}
+
+type ModelMetrics = {
+  train_samples: number
+  test_samples: number
+  train_accuracy: number
+  test_accuracy: number
+  train_loss: number
+  test_loss: number
+  test_balanced_accuracy?: number
+  test_precision?: number
+  test_recall?: number
+  test_f1?: number
+  test_roc_auc?: number | null
+  test_confusion_matrix?: number[][]
+  per_class?: {
+    class0: PerClassMetrics
+    class1: PerClassMetrics
+  }
+  class_distribution?: {
+    class0: number
+    class1: number
+  }
+  class_weights?: {
+    class0: number
+    class1: number
+  }
+  epochs: number
+  learning_rate?: number
+  hidden_layers?: number
+  hidden_units?: number
+  feature_count?: number
+  threshold?: number
+  duration_seconds?: number
+  trained_at?: string
+}
+
+type ModelInfo = {
+  format_version?: number
+  framework?: string
+  architecture?: string
+  img_size: number
+  grid_cells: number
+  feature_count: number
+  hidden_layers?: number
+  hidden_units?: number
+  hidden_activation?: string
+  optimizer?: string
+  epochs: number
+  learning_rate: number
+  random_state: number | null
+  threshold: number
+  trained_at: string
+  duration_seconds: number
+  source?: string
+  dataset_filename?: string | null
+}
+
+type TrainingProgress = {
+  current: number
+  total: number
+  train_accuracy?: number
+  test_accuracy?: number
+}
+
+type ModelStatus = {
+  ready: boolean
+  training: boolean
+  status: "ready" | "training" | "stale" | "not_ready"
+  message: string
+  model: ModelInfo | null
+  metrics: ModelMetrics | null
+  progress: TrainingProgress | null
+  settings: {
+    img_size: number
+    grid_cells: number
+  }
+}
+
+type Prediction = {
+  has_defect: boolean
+  label: "defect" | "clean"
+  label_uk: string
+  probability: number
+  confidence: number
+  threshold: number
+}
+
+type LogMessage = {
+  type: string
+  text: string
+  timestamp: string
+  current?: number
+  total?: number
+  train_accuracy?: number
+  test_accuracy?: number
+  metrics?: ModelMetrics
+  model?: ModelInfo
+  threshold?: number
+}
+
 const API_BASE_URL = "http://127.0.0.1:8000"
+const IMAGE_EXTENSION_REGEX = /\.(png|jpe?g|bmp)$/i
+const MAX_REPORTED_MISMATCHES = 5
+
+type Dimensions = {
+  width: number
+  height: number
+}
+
+type AnalysisResult = {
+  difference_grid: string
+  source_with_grid: string
+  grid_cells: number
+  img_size: number
+  model_ready: boolean
+  prediction: Prediction | null
+  prediction_message: string | null
+}
+
+function base64ToBlob(base64: string, mimeType: string) {
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index)
+  }
+
+  return new Blob([bytes], { type: mimeType })
+}
+
+async function readImageDimensions(blob: Blob): Promise<Dimensions> {
+  if (typeof createImageBitmap === "function") {
+    const bitmap = await createImageBitmap(blob)
+    const dimensions = { width: bitmap.width, height: bitmap.height }
+    bitmap.close()
+    return dimensions
+  }
+
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob)
+    const image = new Image()
+
+    image.onload = () => {
+      resolve({ width: image.naturalWidth, height: image.naturalHeight })
+      URL.revokeObjectURL(url)
+    }
+    image.onerror = () => {
+      reject(new Error("Не вдалося прочитати зображення"))
+      URL.revokeObjectURL(url)
+    }
+    image.src = url
+  })
+}
+
+async function readErrorDetail(response: Response, fallback: string) {
+  try {
+    const data = (await response.json()) as { detail?: unknown }
+
+    if (typeof data.detail === "string") return data.detail
+    if (Array.isArray(data.detail)) {
+      return data.detail
+        .map((item) => (typeof item === "string" ? item : JSON.stringify(item)))
+        .join("; ")
+    }
+  } catch {
+    // Відповідь без JSON — показуємо стандартне повідомлення.
+  }
+
+  return fallback
+}
+
+async function verifyArchiveDimensions(file: File, expectedSize: number) {
+  let zip: JSZip
+
+  try {
+    zip = await JSZip.loadAsync(file)
+  } catch {
+    throw new Error("Не вдалося прочитати ZIP-архів")
+  }
+
+  const entries = Object.values(zip.files).filter(
+    (entry) => !entry.dir && IMAGE_EXTENSION_REGEX.test(entry.name),
+  )
+
+  if (!entries.length) {
+    throw new Error("В архіві не знайдено зображень PNG")
+  }
+
+  const mismatches: string[] = []
+  let mismatchCount = 0
+
+  for (const entry of entries) {
+    try {
+      const blob = await entry.async("blob")
+      const { width, height } = await readImageDimensions(blob)
+
+      if (width !== expectedSize || height !== expectedSize) {
+        mismatchCount += 1
+        if (mismatches.length < MAX_REPORTED_MISMATCHES) {
+          mismatches.push(
+            `${entry.name}: ${width}×${height}, очікується ${expectedSize}×${expectedSize}`,
+          )
+        }
+      }
+    } catch {
+      mismatchCount += 1
+      if (mismatches.length < MAX_REPORTED_MISMATCHES) {
+        mismatches.push(`${entry.name}: не вдалося прочитати зображення`)
+      }
+    }
+  }
+
+  if (mismatchCount) {
+    throw new Error(
+      `Розмір зображень не відповідає налаштуванням (${expectedSize}×${expectedSize}). ` +
+        `Проблемних файлів: ${mismatchCount} з ${entries.length}. ${mismatches.join("; ")}`,
+    )
+  }
+
+  return entries.length
+}
+
+function getLogState(type: string) {
+  if (type.includes("error")) return "warn"
+  if (
+    type.endsWith("_complete") ||
+    type.endsWith("_updated") ||
+    type.endsWith("_generated") ||
+    type.endsWith("_loaded")
+  ) {
+    return "ok"
+  }
+  return "idle"
+}
+
+function formatLogTime(timestamp: string) {
+  const date = new Date(timestamp)
+  return Number.isNaN(date.getTime())
+    ? "--:--:--"
+    : date.toLocaleTimeString("uk-UA", { hour12: false })
+}
+
+function formatPercent(value?: number | null) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? `${value.toFixed(2)}%`
+    : "—"
+}
+
+function formatDecimal(value?: number | null, digits = 4) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value.toFixed(digits)
+    : "—"
+}
+
+function formatDateTime(value?: string | null) {
+  if (!value) return "—"
+
+  const date = new Date(value)
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleString("uk-UA", { hour12: false })
+}
+
+function formatModelSource(source?: string) {
+  if (source === "trained") return "Навчена в системі"
+  if (source === "loaded") return "Завантажена з файлу"
+  return source || "—"
+}
 
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   const paths: Record<IconName, ReactNode> = {
@@ -168,35 +454,62 @@ function FileDrop({
 }
 
 export default function App() {
-  const [mainTab, setMainTab] = useState<"train" | "model">("train")
   const [datasetTab, setDatasetTab] = useState<"generate" | "upload">("generate")
-  const [modal, setModal] = useState<"reference-settings" | "train-settings" | "reference" | "dataset" | null>(null)
+  const [modal, setModal] = useState<"reference-settings" | "train-settings" | "reference" | "dataset" | "source-grid" | "model-details" | null>(null)
   
-  const [seed, setSeed] = useState(42)
+  const [seed, setSeed] = useState<number | null>(null)
   const [imageSize, setImageSize] = useState(200)
   const [gridSize, setGridSize] = useState(10)
   const [reference, setReference] = useState("")
   const [datasetCount, setDatasetCount] = useState(250)
   const [dataset, setDataset] = useState<GeneratedImage[]>([])
   const [isGeneratingDataset, setIsGeneratingDataset] = useState(false)
+  const [datasetProgress, setDatasetProgress] = useState({ current: 0, total: 0 })
   const [selectedDatasetImage, setSelectedDatasetImage] = useState<GeneratedImage | null>(null)
   const [zipFile, setZipFile] = useState<File | null>(null)
+  const [zipOrigin, setZipOrigin] = useState<"generated" | "uploaded" | null>(null)
+  const [zipError, setZipError] = useState("")
+  const [zipNotice, setZipNotice] = useState("")
+  const [isValidatingZip, setIsValidatingZip] = useState(false)
   const [epochs, setEpochs] = useState(200)
-  const [learningRate, setLearningRate] = useState(0.1)
+  const [learningRate, setLearningRate] = useState(0.001)
+  const [hiddenLayers, setHiddenLayers] = useState<0 | 1>(1)
+  const [hiddenUnits, setHiddenUnits] = useState(16)
   const [trainingProgress, setTrainingProgress] = useState(0)
   const [isTraining, setIsTraining] = useState(false)
+  const [modelReady, setModelReady] = useState(false)
+  const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null)
+  const [modelMetrics, setModelMetrics] = useState<ModelMetrics | null>(null)
+  const [trainingError, setTrainingError] = useState("")
   const [modelFile, setModelFile] = useState<File | null>(null)
+  const [isDownloadingModel, setIsDownloadingModel] = useState(false)
+  const [isLoadingModel, setIsLoadingModel] = useState(false)
+  const [modelError, setModelError] = useState("")
+  const [modelNotice, setModelNotice] = useState("")
   const [sourceFile, setSourceFile] = useState<File | null>(null)
   const [sourcePreview, setSourcePreview] = useState("")
+  const [sourceError, setSourceError] = useState("")
   const [differencePreview, setDifferencePreview] = useState("")
+  const [sourceGridPreview, setSourceGridPreview] = useState("")
+  const [prediction, setPrediction] = useState<Prediction | null>(null)
+  const [predictionMessage, setPredictionMessage] = useState("")
   const [processing, setProcessing] = useState(false)
-  const [result, setResult] = useState<"defects" | "clean" | null>(null)
-  const [logs, setLogs] = useState<{ time: string; text: string; state: string }[]>([])
+  const [analysisError, setAnalysisError] = useState("")
+  const [logs, setLogs] = useState<LogMessage[]>([])
   const logRef = useRef<HTMLDivElement>(null)
+  const previewUrlsRef = useRef({
+    sourcePreview: "",
+    reference: "",
+    differencePreview: "",
+    sourceGridPreview: "",
+    dataset: [] as string[],
+  })
+  const sourceValidationRef = useRef(0)
+  const zipValidationRef = useRef(0)
+  const analysisRequestRef = useRef(0)
   const [isGeneratingReference, setIsGeneratingReference] = useState(false)
   const [generationDuration, setGenerationDuration] = useState<number | null>(null)
   const [trainingDuration, setTrainingDuration] = useState<number | null>(null)
-  const [confidence, setConfidence] = useState<number | null>(null)
 
   
 
@@ -206,11 +519,27 @@ export default function App() {
     }
 
   useEffect(() => {
+    previewUrlsRef.current = {
+      sourcePreview,
+      reference,
+      differencePreview,
+      sourceGridPreview,
+      dataset: dataset.map((image) => image.src),
+    }
+  }, [sourcePreview, reference, differencePreview, sourceGridPreview, dataset])
+
+  useEffect(() => {
     return () => {
-      if (sourcePreview.startsWith("blob:")) URL.revokeObjectURL(sourcePreview)
-      if (reference.startsWith("blob:")) URL.revokeObjectURL(reference)
-      dataset.forEach((img) => {
-        if (img.src.startsWith("blob:")) URL.revokeObjectURL(img.src)
+      const urlsToRevoke = [
+        previewUrlsRef.current.sourcePreview,
+        previewUrlsRef.current.reference,
+        previewUrlsRef.current.differencePreview,
+        previewUrlsRef.current.sourceGridPreview,
+        ...previewUrlsRef.current.dataset,
+      ]
+
+      urlsToRevoke.forEach((url) => {
+        if (url.startsWith("blob:")) URL.revokeObjectURL(url)
       })
     }
   }, [])
@@ -219,20 +548,338 @@ export default function App() {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
   }, [logs])
 
-  const addLog = (text: string, state = "idle") => {
-    setLogs((current) => [
-      ...current,
-      {
-        time: new Date().toLocaleTimeString("uk-UA", { hour12: false }),
-        text,
-        state,
-      },
-    ])
+  useEffect(() => {
+    const eventSource = new EventSource(`${API_BASE_URL}/logs/stream`)
+
+    eventSource.onmessage = (event) => {
+      let message: LogMessage
+
+      try {
+        message = JSON.parse(event.data) as LogMessage
+      } catch {
+        return
+      }
+
+      setLogs((current) => [...current, message])
+
+      if (message.type === "dataset_started") {
+        setDatasetProgress({
+          current: message.current ?? 0,
+          total: message.total ?? 0,
+        })
+      } else if (message.type === "dataset_progress") {
+        setDatasetProgress({
+          current: message.current ?? 0,
+          total: message.total ?? 0,
+        })
+      } else if (message.type === "dataset_complete") {
+        setDatasetProgress((current) => ({
+          current: message.total ?? current.total,
+          total: message.total ?? current.total,
+        }))
+      } else if (message.type === "model_training_started") {
+        setIsTraining(true)
+        setTrainingProgress(0)
+        setTrainingError("")
+        setTrainingDuration(null)
+      } else if (message.type === "model_training_progress") {
+        const current = message.current ?? 0
+        const total = message.total ?? 0
+
+        setIsTraining(true)
+        setTrainingProgress(
+          total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 0,
+        )
+      } else if (message.type === "model_training_complete") {
+        setIsTraining(false)
+        setModelReady(true)
+        setTrainingProgress(100)
+        setTrainingError("")
+        setModelError("")
+        setModelNotice("")
+        setPrediction(null)
+        setPredictionMessage("")
+
+        if (message.model) setModelInfo(message.model)
+
+        if (message.metrics) {
+          setModelMetrics(message.metrics)
+          setTrainingDuration(
+            message.metrics.duration_seconds
+              ? message.metrics.duration_seconds * 1000
+              : null,
+          )
+        }
+
+        void loadModelStatus().catch(() => {
+          // Помилки бекенду відображаються через SSE-логи.
+        })
+      } else if (message.type === "model_loaded") {
+        setIsTraining(false)
+        setModelReady(true)
+        setTrainingProgress(100)
+        setTrainingError("")
+        setModelError("")
+        setPrediction(null)
+        setPredictionMessage("")
+
+        if (message.model) setModelInfo(message.model)
+        if (message.metrics) setModelMetrics(message.metrics)
+
+        void loadModelStatus().catch(() => {
+          // Помилки бекенду відображаються через SSE-логи.
+        })
+      } else if (message.type === "model_training_error") {
+        setIsTraining(false)
+        setTrainingError(message.text)
+      } else if (message.type === "model_invalidated") {
+        setModelReady(false)
+        setModelInfo(null)
+        setModelMetrics(null)
+        setIsTraining(false)
+        setTrainingProgress(0)
+        setTrainingDuration(null)
+        setTrainingError("")
+        setPrediction(null)
+        setPredictionMessage("")
+        setModal((current) => (current === "model-details" ? null : current))
+      }
+    }
+
+    return () => eventSource.close()
+  }, [])
+
+  const setReferenceFromBlob = (blob: Blob) => {
+    const url = URL.createObjectURL(blob)
+    setReference((current) => {
+      if (current.startsWith("blob:")) URL.revokeObjectURL(current)
+      return url
+    })
+  }
+
+  const loadReference = async () => {
+    const response = await fetch(`${API_BASE_URL}/template`, {
+      cache: "no-store",
+    })
+
+    if (response.status === 404) {
+      setReference((current) => {
+        if (current.startsWith("blob:")) URL.revokeObjectURL(current)
+        return ""
+      })
+      return false
+    }
+
+    if (!response.ok) throw new Error("Не вдалося отримати еталонне зображення")
+
+    setReferenceFromBlob(await response.blob())
+    return true
+  }
+
+  const applyModelStatus = (status: ModelStatus) => {
+    setModelReady(status.ready)
+    setModelInfo(status.model)
+    setModelMetrics(status.metrics)
+    setIsTraining(status.training)
+    setTrainingError("")
+
+    if (status.training) {
+      const progress = status.progress
+      setTrainingProgress(
+        progress && progress.total > 0
+          ? Math.min(100, Math.round((progress.current / progress.total) * 100))
+          : 0,
+      )
+      return
+    }
+
+    if (status.ready) {
+      setTrainingProgress(100)
+      setTrainingDuration(
+        status.metrics?.duration_seconds
+          ? status.metrics.duration_seconds * 1000
+          : null,
+      )
+    } else {
+      setTrainingProgress(0)
+      setTrainingDuration(null)
+    }
+  }
+
+  const loadModelStatus = async () => {
+    const response = await fetch(`${API_BASE_URL}/model/status`, {
+      cache: "no-store",
+    })
+
+    if (!response.ok) throw new Error("Не вдалося отримати статус моделі")
+
+    applyModelStatus((await response.json()) as ModelStatus)
+  }
+
+  useEffect(() => {
+    let cancelled = false
+
+    const loadBackendState = async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/settings`)
+        if (!response.ok) throw new Error("Не вдалося отримати налаштування системи")
+
+        const settings = (await response.json()) as SystemSettings
+        if (cancelled) return
+
+        setSeed(settings.random_seed)
+        setImageSize(settings.img_size)
+        setGridSize(settings.grid_cells)
+      } catch {
+        // Помилки бекенду відображаються через SSE-логи.
+      }
+
+      if (cancelled) return
+
+      try {
+        const response = await fetch(`${API_BASE_URL}/training-settings`)
+        if (!response.ok) throw new Error("Не вдалося отримати налаштування навчання")
+
+        const settings = (await response.json()) as TrainingSettings
+        if (cancelled) return
+
+        setEpochs(settings.epochs)
+        setLearningRate(settings.learning_rate)
+        setHiddenLayers(settings.hidden_layers)
+        setHiddenUnits(settings.hidden_units)
+      } catch {
+        // Помилки бекенду відображаються через SSE-логи.
+      }
+
+      if (cancelled) return
+
+      try {
+        await loadModelStatus()
+      } catch {
+        // Помилки бекенду відображаються через SSE-логи.
+      }
+
+      if (cancelled) return
+
+      try {
+        await loadReference()
+      } catch {
+        // Помилки бекенду відображаються через SSE-логи.
+      }
+    }
+
+    void loadBackendState()
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const clearAnalysisPreviews = () => {
+    setDifferencePreview((current) => {
+      if (current.startsWith("blob:")) URL.revokeObjectURL(current)
+      return ""
+    })
+    setSourceGridPreview((current) => {
+      if (current.startsWith("blob:")) URL.revokeObjectURL(current)
+      return ""
+    })
+    setPrediction(null)
+    setPredictionMessage("")
+    setAnalysisError("")
+  }
+
+  const validateSourceFile = async (file: File, expectedSize: number) => {
+    const validationId = ++sourceValidationRef.current
+
+    try {
+      const { width, height } = await readImageDimensions(file)
+      if (validationId !== sourceValidationRef.current) return false
+
+      if (width !== expectedSize || height !== expectedSize) {
+        setSourceError(
+          `Розмір ${width}×${height} не відповідає налаштуванням ${expectedSize}×${expectedSize}.`,
+        )
+        return false
+      }
+
+      setSourceError("")
+      return true
+    } catch {
+      if (validationId === sourceValidationRef.current) {
+        setSourceError("Не вдалося прочитати розміри зображення.")
+      }
+      return false
+    }
+  }
+
+  const validateArchive = async (file: File, expectedSize: number) => {
+    const validationId = ++zipValidationRef.current
+    setIsValidatingZip(true)
+    setZipError("")
+    setZipNotice("")
+
+    try {
+      await verifyArchiveDimensions(file, expectedSize)
+      if (validationId !== zipValidationRef.current) return
+
+      const formData = new FormData()
+      formData.append("file", file)
+
+      const response = await fetch(`${API_BASE_URL}/dataset/validate`, {
+        method: "POST",
+        body: formData,
+      })
+
+      if (validationId !== zipValidationRef.current) return
+
+      if (!response.ok) {
+        throw new Error(
+          await readErrorDetail(response, "Архів не пройшов перевірку розмірів"),
+        )
+      }
+
+      const data = (await response.json()) as { images: number; img_size: number }
+      if (validationId !== zipValidationRef.current) return
+
+      setZipNotice(
+        `Архів перевірено: ${data.images} зображень розміру ${data.img_size}×${data.img_size}.`,
+      )
+    } catch (error) {
+      if (validationId !== zipValidationRef.current) return
+
+      setZipError(
+        error instanceof Error ? error.message : "Не вдалося перевірити ZIP-архів",
+      )
+    } finally {
+      if (validationId === zipValidationRef.current) {
+        setIsValidatingZip(false)
+      }
+    }
+  }
+
+  const handleZipUpload = (file: File | null) => {
+    if (!file) {
+      zipValidationRef.current += 1
+      setIsValidatingZip(false)
+      setZipFile(null)
+      setZipOrigin(null)
+      setZipError("")
+      setZipNotice("")
+      return
+    }
+
+    dataset.forEach((image) => {
+      if (image.src.startsWith("blob:")) URL.revokeObjectURL(image.src)
+    })
+    setDataset([])
+    setZipFile(file)
+    setZipOrigin("uploaded")
+    void validateArchive(file, imageSize)
   }
 
   const saveSettings = async () => {
     try {
-      addLog("Оновлення налаштувань системи...")
       const response = await fetch(`${API_BASE_URL}/settings`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -243,45 +890,124 @@ export default function App() {
         }),
       })
 
-      if (!response.ok) {
-        const errorData = await response.json()
-        throw new Error(errorData.detail || "Помилка збереження налаштувань")
+      if (!response.ok) return
+
+      const data = await response.json()
+      const currentSettings = data.current_settings as SystemSettings
+      const imageSizeChanged = currentSettings.img_size !== imageSize
+
+      setSeed(currentSettings.random_seed)
+      setImageSize(currentSettings.img_size)
+      setGridSize(currentSettings.grid_cells)
+
+      setModal(null)
+      analysisRequestRef.current += 1
+      setProcessing(false)
+      clearAnalysisPreviews()
+
+      if (imageSizeChanged) {
+        if (sourceFile) {
+          void validateSourceFile(sourceFile, currentSettings.img_size)
+        }
+
+        dataset.forEach((image) => {
+          if (image.src.startsWith("blob:")) URL.revokeObjectURL(image.src)
+        })
+
+        if (zipOrigin === "uploaded" && zipFile) {
+          setDataset([])
+          void validateArchive(zipFile, currentSettings.img_size)
+        } else {
+          zipValidationRef.current += 1
+          setIsValidatingZip(false)
+          setDataset([])
+          setZipFile(null)
+          setZipOrigin(null)
+          setZipError("")
+          setZipNotice("")
+        }
       }
 
-      addLog("Налаштування успішно збережено на бекенді", "ok")
-      setModal(null)
-    } catch (err: any) {
-      addLog(`Помилка: ${err.message}`, "warn")
+      try {
+        await loadReference()
+      } catch {
+        // Помилки бекенду відображаються через SSE-логи.
+      }
+
+      try {
+        await loadModelStatus()
+      } catch {
+        // Помилки бекенду відображаються через SSE-логи.
+      }
+    } catch {
+      // Помилки бекенду відображаються через SSE-логи.
     }
   }
 
-    const generateReference = async () => {
+  const saveTrainingSettings = async () => {
+    const safeHiddenUnits = Math.min(256, Math.max(1, Math.round(hiddenUnits) || 1))
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/training-settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          epochs,
+          learning_rate: learningRate,
+          hidden_layers: hiddenLayers,
+          hidden_units: safeHiddenUnits,
+        }),
+      })
+
+      if (!response.ok) {
+        setTrainingError(
+          await readErrorDetail(response, "Не вдалося зберегти налаштування навчання"),
+        )
+        return
+      }
+
+      const data = await response.json()
+      const currentSettings = data.current_settings as TrainingSettings
+
+      setEpochs(currentSettings.epochs)
+      setLearningRate(currentSettings.learning_rate)
+      setHiddenLayers(currentSettings.hidden_layers)
+      setHiddenUnits(currentSettings.hidden_units)
+      setTrainingError("")
+      setModal(null)
+    } catch {
+      // Помилки бекенду відображаються через SSE-логи.
+    }
+  }
+
+  const generateReference = async () => {
     if (isGeneratingReference) return
     setIsGeneratingReference(true)
     try {
-        addLog("Запит еталонного зображення...")
-        const response = await fetch(`${API_BASE_URL}/template?t=${Date.now()}`)
-        if (!response.ok) throw new Error("Не вдалося отримати еталон")
+      const response = await fetch(`${API_BASE_URL}/template`, {
+        method: "POST",
+      })
+      if (!response.ok) throw new Error("Не вдалося згенерувати еталон")
 
-        const blob = await response.blob()
-        if (reference.startsWith("blob:")) URL.revokeObjectURL(reference)
-        const url = URL.createObjectURL(blob)
-        setReference(url)
-        addLog("Еталонне зображення отримано від сервера", "ok")
-    } catch (err: any) {
-        addLog(`Помилка генерації еталона: ${err.message}`, "warn")
+      setReferenceFromBlob(await response.blob())
+    } catch {
+      // Помилки бекенду відображаються через SSE-логи.
     } finally {
-        setIsGeneratingReference(false)
+      setIsGeneratingReference(false)
     }
-    }
+  }
 
   const generateDataset = async () => {
     if (isGeneratingDataset) return
+    zipValidationRef.current += 1
+    setIsValidatingZip(false)
+    setZipError("")
+    setZipNotice("")
     setIsGeneratingDataset(true)
     setGenerationDuration(null)
     const startTime = performance.now()
     const count = Math.max(1, datasetCount || 1)
-    addLog(`Запит на генерацію датасету: ${count} пар зображень...`)
+    setDatasetProgress({ current: 0, total: count })
 
     try {
       const response = await fetch(`${API_BASE_URL}/dataset`, {
@@ -293,13 +1019,10 @@ export default function App() {
       if (!response.ok) throw new Error("Помилка генерації на бекенді")
 
       const zipBlob = await response.blob()
-      addLog("ZIP-архів отримано, розархівовуємо для відображення...", "idle")
 
       const zip = await JSZip.loadAsync(zipBlob)
       const images: GeneratedImage[] = []
       let id = 0
-
-      setZipFile(new File([zipBlob], "dataset.zip", { type: "application/zip" }))
 
       for (const [filename, file] of Object.entries(zip.files)) {
         if (!file.dir && filename.endsWith(".png") && filename !== "template.png") {
@@ -312,57 +1035,196 @@ export default function App() {
         }
       }
 
+      dataset.forEach((image) => {
+        if (image.src.startsWith("blob:")) URL.revokeObjectURL(image.src)
+      })
+
       setDataset(images)
+      setZipFile(new File([zipBlob], "dataset.zip", { type: "application/zip" }))
+      setZipOrigin("generated")
+      setZipNotice(
+        `Згенеровано ${images.length} зображень розміру ${imageSize}×${imageSize}.`,
+      )
+      setDatasetProgress({ current: count, total: count })
       const duration = performance.now() - startTime
       setGenerationDuration(duration)
-      addLog(`Датасет згенеровано: ${images.length} файлів`, "ok")
-    } catch (err: any) {
-      addLog(`Помилка генерації датасету: ${err.message}`, "warn")
+    } catch {
+      // Помилки бекенду відображаються через SSE-логи.
     } finally {
       setIsGeneratingDataset(false)
     }
   }
 
-  const startTraining = () => {
-    if (!reference) {
-      addLog("Неможливо розпочати навчання: відсутній еталон", "warn")
-      return
-    }
-    if ((!dataset.length && !zipFile) || isTraining) return
+  const startTraining = async () => {
+    if (!reference || !zipFile) return
+    if (isValidatingZip || Boolean(zipError) || isTraining) return
+
     setIsTraining(true)
-    setTrainingProgress(4)
+    setTrainingProgress(0)
+    setTrainingError("")
+    setModelError("")
+    setModelNotice("")
     setTrainingDuration(null)
     const startTime = performance.now()
-    addLog(`Навчання моделі розпочато · ${epochs} епох`)
-    const interval = window.setInterval(() => {
-      setTrainingProgress((current) => {
-        const next = Math.min(current + 4, 100)
-        if (next === 100) {
-          window.clearInterval(interval)
-          setIsTraining(false)
-          const duration = performance.now() - startTime
-          setTrainingDuration(duration)
-          addLog("Навчання моделі завершено", "ok")
-        }
-        return next
+
+    try {
+      const formData = new FormData()
+      formData.append("file", zipFile)
+
+      const response = await fetch(`${API_BASE_URL}/model/train`, {
+        method: "POST",
+        body: formData,
       })
-    }, 90)
+
+      if (!response.ok) {
+        const detail = await readErrorDetail(
+          response,
+          "Не вдалося навчити модель",
+        )
+        setTrainingError(detail)
+        setIsTraining(false)
+        return
+      }
+
+      const data = (await response.json()) as {
+        metrics: ModelMetrics
+        model: ModelInfo
+      }
+
+      setModelReady(true)
+      setModelInfo(data.model)
+      setModelMetrics(data.metrics)
+      setTrainingProgress(100)
+      setTrainingError("")
+      setModelError("")
+      setModelNotice("")
+      setTrainingDuration(
+        data.metrics.duration_seconds
+          ? data.metrics.duration_seconds * 1000
+          : performance.now() - startTime,
+      )
+    } catch {
+      setTrainingError("Не вдалося отримати відповідь від сервера навчання")
+    } finally {
+      setIsTraining(false)
+    }
+  }
+
+  const downloadModel = async () => {
+    if (!modelReady || isDownloadingModel) return
+
+    setIsDownloadingModel(true)
+    setModelError("")
+    setModelNotice("")
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/model/download`, {
+        cache: "no-store",
+      })
+
+      if (!response.ok) {
+        throw new Error(
+          await readErrorDetail(response, "Не вдалося скачати модель"),
+        )
+      }
+
+      const blob = await response.blob()
+      const url = URL.createObjectURL(blob)
+      downloadData(url, "defect-model.zip")
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+      setModelNotice("Модель скачано у ZIP-архіві defect-model.zip.")
+    } catch (error) {
+      setModelError(
+        error instanceof Error ? error.message : "Не вдалося скачати модель",
+      )
+    } finally {
+      setIsDownloadingModel(false)
+    }
+  }
+
+  const loadModelFile = async () => {
+    if (!modelFile || isLoadingModel) return
+
+    setIsLoadingModel(true)
+    setModelError("")
+    setModelNotice("")
+
+    try {
+      const formData = new FormData()
+      formData.append("file", modelFile)
+
+      const response = await fetch(`${API_BASE_URL}/model/load`, {
+        method: "POST",
+        body: formData,
+      })
+
+      if (!response.ok) {
+        throw new Error(
+          await readErrorDetail(response, "Не вдалося завантажити модель"),
+        )
+      }
+
+      const data = (await response.json()) as {
+        model: ModelInfo
+        metrics: ModelMetrics
+      }
+
+      setModelReady(true)
+      setModelInfo(data.model)
+      setModelMetrics(data.metrics)
+      setTrainingProgress(100)
+      setTrainingError("")
+      setPrediction(null)
+      setPredictionMessage("")
+      setModelNotice("Модель успішно завантажено та готова до роботи.")
+
+      try {
+        await loadModelStatus()
+      } catch {
+        // Статус уже оновлено з відповіді /model/load.
+      }
+    } catch (error) {
+      setModelError(
+        error instanceof Error ? error.message : "Не вдалося завантажити модель",
+      )
+    } finally {
+      setIsLoadingModel(false)
+    }
   }
 
   const getTrainingHint = () => {
     if (!reference) return "Спочатку згенеруйте еталонне зображення"
-    if (!dataset.length && !zipFile) return "Спочатку згенеруйте або завантажте датасет"
-    return `Дані готові · ${epochs} епох · швидкість ${learningRate}`
+    if (isTraining) return "Триває навчання моделі, епохи надходять у логи"
+    if (modelReady) {
+      return modelMetrics
+        ? `Модель готова · test accuracy ${modelMetrics.test_accuracy}%`
+        : "Модель готова до роботи"
+    }
+    if (isValidatingZip) return "Перевіряємо розміри зображень в архіві"
+    if (zipError) return "Архів датасету не пройшов перевірку розмірів"
+    if (!zipFile) return "Спочатку згенеруйте або завантажте датасет"
+
+    const architecture =
+      hiddenLayers === 1
+        ? `1 прихований шар (${hiddenUnits} нейронів)`
+        : "без прихованого шару"
+
+    return `Дані готові · ${epochs} епох · LR ${learningRate} · ${architecture}`
   }
 
   const onSourceFile = (file: File | null) => {
     setSourceFile(file)
-    setDifferencePreview("")
-    setResult(null)
-    setConfidence(null)
+    sourceValidationRef.current += 1
+    analysisRequestRef.current += 1
+    setProcessing(false)
+    setSourceError("")
+    clearAnalysisPreviews()
     if (sourcePreview.startsWith("blob:")) URL.revokeObjectURL(sourcePreview)
     setSourcePreview(file ? URL.createObjectURL(file) : "")
-    if (file) addLog(`Зображення «${file.name}» завантажено`, "ok")
+
+    if (file) {
+      void validateSourceFile(file, imageSize)
+    }
   }
 
   const downloadDatasetZip = () => {
@@ -370,40 +1232,98 @@ export default function App() {
     const url = URL.createObjectURL(zipFile)
     downloadData(url, "dataset.zip")
     URL.revokeObjectURL(url)
-    addLog("Архів датасету збережено на пристрій", "ok")
   }
 
-  const processImage = () => {
-    if (!isModelReady) {
-      addLog("Помилка: неможливо виконати аналіз без навченої моделі", "warn")
-      return
-    }
+  const downloadDifferenceGrid = () => {
+    if (!differencePreview) return
+    downloadData(differencePreview, "difference_grid.png")
+  }
+
+  const processImage = async () => {
     if (!sourceFile || processing) return
+
+    const requestId = ++analysisRequestRef.current
     setProcessing(true)
-    setResult(null)
-    setConfidence(null)
-    addLog("Порівнюємо геометрію з еталоном...")
-    
-    window.setTimeout(() => {
-      const hasDefects = sourceFile.name.includes("class1")
+    setAnalysisError("")
+    clearAnalysisPreviews()
 
-      const predictedProbability = Number((0.92 + Math.random() * 0.079).toFixed(4))
+    try {
+      const formData = new FormData()
+      formData.append("file", sourceFile)
 
-      setResult(hasDefects ? "defects" : "clean")
-      setConfidence(predictedProbability)
-      setProcessing(false)
-      addLog(
-        hasDefects
-          ? `Аналіз завершено: знайдено дефекти (впевненість: ${(predictedProbability * 100).toFixed(2)}%)`
-          : `Аналіз завершено: дефектів немає (впевненість: ${(predictedProbability * 100).toFixed(2)}%)`,
-        hasDefects ? "warn" : "ok",
-      )
-    }, 800)
+      const response = await fetch(`${API_BASE_URL}/analyze`, {
+        method: "POST",
+        body: formData,
+      })
+
+      if (requestId !== analysisRequestRef.current) return
+
+      if (!response.ok) {
+        const detail = await readErrorDetail(
+          response,
+          "Не вдалося сформувати різницеву сітку",
+        )
+        if (requestId !== analysisRequestRef.current) return
+
+        setAnalysisError(detail)
+
+        if (detail.includes("Розмір вхідного зображення")) {
+          setSourceError(detail)
+        }
+        return
+      }
+
+      const result = (await response.json()) as AnalysisResult
+      if (requestId !== analysisRequestRef.current) return
+
+      const differenceBlob = base64ToBlob(result.difference_grid, "image/png")
+      const sourceGridBlob = base64ToBlob(result.source_with_grid, "image/png")
+
+      setDifferencePreview((current) => {
+        if (current.startsWith("blob:")) URL.revokeObjectURL(current)
+        return URL.createObjectURL(differenceBlob)
+      })
+      setSourceGridPreview((current) => {
+        if (current.startsWith("blob:")) URL.revokeObjectURL(current)
+        return URL.createObjectURL(sourceGridBlob)
+      })
+      setPrediction(result.prediction)
+      setPredictionMessage(result.prediction_message ?? "")
+    } catch {
+      if (requestId === analysisRequestRef.current) {
+        setAnalysisError("Не вдалося отримати результат аналізу")
+      }
+    } finally {
+      if (requestId === analysisRequestRef.current) {
+        setProcessing(false)
+      }
+    }
   }
 
-  const isModelReady = trainingProgress === 100 || Boolean(modelFile)
+  const datasetProgressPercent =
+    datasetProgress.total > 0
+      ? Math.min(100, Math.round((datasetProgress.current / datasetProgress.total) * 100))
+      : 0
 
-  const trainingReady = (dataset.length > 0 || Boolean(zipFile)) && Boolean(reference)
+  const trainingReady =
+    Boolean(zipFile) &&
+    Boolean(reference) &&
+    !isValidatingZip &&
+    !zipError
+
+  const displayedTrainingProgress = isTraining
+    ? trainingProgress
+    : modelReady
+    ? 100
+    : 0
+
+  const currentFeatureCount = gridSize * gridSize
+  const modelCompatible = Boolean(
+    modelInfo &&
+      modelInfo.img_size === imageSize &&
+      modelInfo.grid_cells === gridSize &&
+      modelInfo.feature_count === currentFeatureCount,
+  )
 
   return (
     <div className="app-shell">
@@ -459,26 +1379,8 @@ export default function App() {
               </button>
             </div>
 
-            <div className="main-tabs" role="tablist">
-              <button
-                className={mainTab === "train" ? "active" : ""}
-                onClick={() => setMainTab("train")}
-                role="tab"
-              >
-                Тренування моделі
-              </button>
-              {/* <button
-                className={mainTab === "model" ? "active" : ""}
-                onClick={() => setMainTab("model")}
-                role="tab"
-              >
-                Завантажити модель
-              </button> */}
-            </div>
-
-            {mainTab === "train" ? (
-              <div className="tab-content">
-                <div className="sub-tabs">
+            <div className="tab-content">
+              <div className="sub-tabs">
                   <button
                     className={datasetTab === "generate" ? "active" : ""}
                     onClick={() => setDatasetTab("generate")}
@@ -513,14 +1415,23 @@ export default function App() {
                         disabled={isGeneratingDataset}
                         onClick={generateDataset}
                       >
-                        {isGeneratingDataset ? (
-                            <span className="button-spinner" aria-hidden="true" />
-                        ) : (
-                            <Icon name="spark" />
-                        )}
+                        <Icon name="spark" />
                         {isGeneratingDataset ? "Генерація..." : "Генерувати"}
                       </button>
                     </div>
+                    {isGeneratingDataset && (
+                      <div className="dataset-progress">
+                        <div className="progress-label">
+                          <span>
+                            {datasetProgress.current} / {datasetProgress.total} пар
+                          </span>
+                          <strong>{datasetProgressPercent}%</strong>
+                        </div>
+                        <div className="progress-track">
+                          <span style={{ width: `${datasetProgressPercent}%` }} />
+                        </div>
+                      </div>
+                    )}
                     {dataset.length > 0 && (
                       <div className="generated-block">
                         <div className="generated-meta">
@@ -548,8 +1459,18 @@ export default function App() {
                               <button
                                 className="text-button danger"
                                 onClick={() => {
+                                  dataset.forEach((image) => {
+                                    if (image.src.startsWith("blob:")) {
+                                      URL.revokeObjectURL(image.src)
+                                    }
+                                  })
+                                  zipValidationRef.current += 1
+                                  setIsValidatingZip(false)
                                   setDataset([])
                                   setZipFile(null)
+                                  setZipOrigin(null)
+                                  setZipError("")
+                                  setZipNotice("")
                                   setGenerationDuration(null)
                                 }}
                               >
@@ -581,23 +1502,29 @@ export default function App() {
                       accept=".zip,application/zip"
                       file={zipFile}
                       label="ZIP-архів із датасетом"
-                      onChange={(file) => {
-                        setZipFile(file)
-                        if (file) addLog(`Архів «${file.name}» завантажено`, "ok")
-                      }}
+                      onChange={handleZipUpload}
                     />
+                    {isValidatingZip && (
+                      <p className="field-hint">Перевіряємо розміри зображень в архіві…</p>
+                    )}
+                    {zipError && <p className="field-error">{zipError}</p>}
+                    {!zipError && zipNotice && (
+                      <p className="field-success">{zipNotice}</p>
+                    )}
                   </div>
                 )}
 
                 <div
                   className={`model-status ${
-                    trainingProgress === 100 || modelFile ? "ready" : ""
+                    isTraining ? "training" : modelReady ? "ready" : ""
                   }`}
                 >
                   <span className="model-status-dot" />
                   <span>Статус моделі</span>
                   <strong>
-                    {trainingProgress === 100 || modelFile
+                    {isTraining
+                      ? "Модель навчається"
+                      : modelReady
                       ? "Модель готова до роботи"
                       : "Модель відсутня"}
                   </strong>
@@ -627,8 +1554,8 @@ export default function App() {
                     <div className="progress-label">
                     <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                         <span>
-                        {trainingProgress === 100
-                            ? "Навчання завершено"
+                        {modelReady && !isTraining
+                            ? "Модель навчено"
                             : isTraining
                             ? "Навчаємо модель"
                             : "Очікує запуску"}
@@ -639,38 +1566,84 @@ export default function App() {
                         </span>
                         )}
                     </div>
-                    <strong>{trainingProgress}%</strong>
+                    <strong>{displayedTrainingProgress}%</strong>
                     </div>
                     <div className="progress-track">
-                      <span style={{ width: `${trainingProgress}%` }} />
+                      <span style={{ width: `${displayedTrainingProgress}%` }} />
                     </div>
                   </div>
                 </div>
+                {trainingError && (
+                  <p className="field-error analysis-error">{trainingError}</p>
+                )}
+
+                <div className="model-controls">
+                  <div className="model-controls-head">
+                    <div>
+                      <h3>Керування моделлю</h3>
+                      <p>
+                        Експортуйте навчену модель у ZIP-бандл або завантажте
+                        сумісну модель.
+                      </p>
+                    </div>
+                    <button
+                      className="secondary-button"
+                      disabled={!modelReady || isTraining || isDownloadingModel}
+                      onClick={downloadModel}
+                    >
+                      {isDownloadingModel ? (
+                        <span className="button-spinner" aria-hidden="true" />
+                      ) : (
+                        <Icon name="download" />
+                      )}
+                      {isDownloadingModel ? "Скачування..." : "Скачати модель"}
+                    </button>
+                  </div>
+
+                  <div className="model-load-row">
+                    <FileDrop
+                      accept=".zip,application/zip"
+                      file={modelFile}
+                      label="ZIP-архів моделі"
+                      onChange={(file) => {
+                        setModelFile(file)
+                        setModelError("")
+                        setModelNotice("")
+                      }}
+                    />
+                    <button
+                      className="secondary-button"
+                      disabled={!modelFile || isTraining || isLoadingModel}
+                      onClick={loadModelFile}
+                    >
+                      {isLoadingModel ? (
+                        <span className="button-spinner" aria-hidden="true" />
+                      ) : (
+                        <Icon name="upload" />
+                      )}
+                      {isLoadingModel ? "Завантаження..." : "Завантажити модель"}
+                    </button>
+                  </div>
+
+                  {modelError && (
+                    <p className="field-error model-control-message">{modelError}</p>
+                  )}
+                  {!modelError && modelNotice && (
+                    <p className="field-success model-control-message">
+                      {modelNotice}
+                    </p>
+                  )}
+                  {/* {modelInfo && (
+                    <p className="field-hint model-control-message">
+                      {modelInfo.framework === "tensorflow"
+                        ? "TensorFlow/Keras"
+                        : modelInfo.framework || "Модель"}{" "}
+                      · {modelInfo.architecture || "архітектура невідома"} ·
+                      threshold {formatDecimal(modelInfo.threshold, 2)}
+                    </p>
+                  )} */}
+                </div>
               </div>
-            ) : (
-              <div className="tab-content model-upload">
-                <FileDrop
-                  accept=".onnx,.h5,.pt,.pth,.model"
-                  file={modelFile}
-                  label="Файл навченої моделі"
-                  onChange={setModelFile}
-                />
-                <button
-                  className="secondary-button"
-                  disabled={!modelFile}
-                  onClick={() => {
-                    if (modelFile)
-                      downloadData(
-                        URL.createObjectURL(modelFile),
-                        modelFile.name,
-                      )
-                  }}
-                >
-                  <Icon name="download" />
-                  Скачати модель
-                </button>
-              </div>
-            )}
           </section>
 
           <section className="zone processing-zone">
@@ -693,7 +1666,7 @@ export default function App() {
                   ) : (
                     <label className="stage-placeholder" htmlFor="source-image">
                       <input
-                        accept="image/png, image/jpeg, image/bmp, .png, .jpg, .jpeg, .bmp"
+                        accept="image/png, .png"
                         id="source-image"
                         onChange={(event: ChangeEvent<HTMLInputElement>) =>
                           onSourceFile(event.target.files?.[0] ?? null)
@@ -703,11 +1676,23 @@ export default function App() {
                       <span className="upload-icon">
                         <Icon name="upload" />
                       </span>
-                      <strong>Завантажити PNG, BMP, JPG</strong>
+                      <strong>Завантажити PNG</strong>
                       <small>Оберіть зображення для аналізу</small>
                     </label>
                   )}
                 </div>
+                {sourceGridPreview && (
+                  <button
+                    className="replace-file preview-image"
+                    onClick={() => setModal("source-grid")}
+                  >
+                    <Icon name="adjust" size={14} /> Показати зображення із сіткою
+                  </button>
+                )}
+                <p className="field-hint">
+                  Потрібне зображення {imageSize}×{imageSize} px.
+                </p>
+                {sourceError && <p className="field-error">{sourceError}</p>}
                 {sourceFile && (
                   <button
                     className="replace-file"
@@ -738,12 +1723,25 @@ export default function App() {
                     </div>
                   )}
                 </div>
+                {differencePreview && (
+                  <>
+                    <button
+                      className="replace-file download"
+                      onClick={downloadDifferenceGrid}
+                    >
+                      <Icon name="download" size={14} /> Завантажити зображення
+                    </button>
+                    <p className="field-hint">
+                      Червоний — ділянки темніші за еталон, синій — світліші.
+                    </p>
+                  </>
+                )}
               </div>
             </div>
 
             <button
               className="analyze-button"
-              disabled={!sourceFile || processing || !isModelReady}
+              disabled={!sourceFile || processing || Boolean(sourceError) || !reference}
               onClick={processImage}
             >
               {processing ? (
@@ -752,19 +1750,39 @@ export default function App() {
                     <Icon name="spark" />
                 )}
                 {processing
-                  ? "Виконуємо аналіз..."
-                  : !isModelReady
-                  ? "Модель не готова"
+                  ? "Формуємо різницеву сітку..."
+                  : !reference
+                  ? "Спочатку згенеруйте еталон"
+                  : sourceError
+                  ? "Виправте розмір зображення"
                   : "Виявити дефекти"}
             </button>
 
-            <div className={`result-card ${result ?? ""}`}>
+            {analysisError && (
+              <p className="field-error analysis-error">{analysisError}</p>
+            )}
+
+            <div
+              className={`result-card ${
+                prediction
+                  ? prediction.has_defect
+                    ? "defects"
+                    : "clean"
+                  : differencePreview
+                  ? "clean"
+                  : ""
+              }`}
+            >
               <div className="result-icon">
                 <Icon
                   name={
-                    result === "clean"
+                    prediction
+                      ? prediction.has_defect
+                        ? "adjust"
+                        : "check"
+                      : differencePreview
                       ? "check"
-                      : result === "defects"
+                      : processing
                       ? "adjust"
                       : "image"
                   }
@@ -773,34 +1791,54 @@ export default function App() {
               <div>
                 <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                   <span className="eyebrow">Результат обробки</span>
-                  {result && confidence !== null && (
-                    <span className={`time-badge ${result === "clean" ? "" : "light"}`}>
-                      Точність: {(confidence * 100).toFixed(1)}%
-                    </span>
-                  )}
                 </div>
                 <h3>
-                  {result === "clean"
-                    ? "Дефектів не виявлено"
-                    : result === "defects"
-                    ? "Виявлено дефекти"
+                  {prediction
+                    ? prediction.has_defect
+                      ? "Модель виявила дефект"
+                      : "Модель не виявила дефектів"
+                    : differencePreview
+                    ? "Різницеву сітку сформовано"
+                    : processing
+                    ? "Формуємо різницеву сітку"
                     : "Очікуємо на аналіз"}
                 </h3>
                 <p>
-                  {result
-                    ? result === "clean"
-                      ? `Геометрія відповідає еталонному зображенню (ймовірність цілісності: ${(confidence! * 100).toFixed(2)}%).`
-                      : `На різницевій сітці позначено дефекти (ймовірність браку: ${(confidence! * 100).toFixed(2)}%).`
-                    : !isModelReady
-                    ? "Спочатку натренуйте або завантажте модель для виконання аналізу."
-                    : "Завантажте зображення та запустіть перевірку."}
+                  {prediction
+                    ? `Ймовірність дефекту: ${(prediction.probability * 100).toFixed(
+                        1,
+                      )}%. Впевненість моделі: ${(prediction.confidence * 100).toFixed(1)}%.`
+                    : differencePreview
+                    ? predictionMessage ||
+                      "Вхідне зображення порівняно з еталоном. Для класифікації дефектів навчіть модель."
+                    : !reference
+                    ? "Спочатку згенеруйте еталонне зображення."
+                    : sourceError
+                    ? "Виправте розмір вхідного зображення, щоб продовжити."
+                    : !sourceFile
+                    ? "Завантажте зображення та запустіть перевірку."
+                    : "Натисніть «Виявити дефекти», щоб сформувати різницеву сітку."}
                 </p>
               </div>
-              {result && (
-                <span className="result-badge">
-                  {result === "clean" ? "OK" : "УВАГА"}
-                </span>
-              )}
+              <div className="result-actions">
+                {differencePreview && (
+                  <span className="result-badge">
+                    {prediction
+                      ? prediction.has_defect
+                        ? "ДЕФЕКТ"
+                        : "БЕЗ ДЕФЕКТУ"
+                      : "ГОТОВО"}
+                  </span>
+                )}
+                {modelReady && (
+                  <button
+                    className="text-button details-button"
+                    onClick={() => setModal("model-details")}
+                  >
+                    <Icon name="adjust" size={14} /> Детальніше
+                  </button>
+                )}
+              </div>
             </div>
 
             <div className="logs">
@@ -815,14 +1853,14 @@ export default function App() {
               <div className="log-list" ref={logRef}>
                 {logs.length ? (
                   logs.map((log, index) => (
-                    <div className="log-row" key={`${log.time}-${index}`}>
-                      <span className={`log-dot ${log.state}`} />
-                      <time>{log.time}</time>
+                    <div className="log-row" key={`${log.timestamp}-${index}`}>
+                      <span className={`log-dot ${getLogState(log.type)}`} />
+                      <time>{formatLogTime(log.timestamp)}</time>
                       <span>{log.text}</span>
                     </div>
                   ))
                 ) : (
-                  <div className="empty-logs">Логи очищено</div>
+                  <div className="empty-logs">Повідомлень ще немає</div>
                 )}
               </div>
             </div>
@@ -836,9 +1874,13 @@ export default function App() {
             <label>
               <span>Зерно рандому</span>
               <input
-                onChange={(event) => setSeed(Number(event.target.value))}
+                onChange={(event) =>
+                  setSeed(
+                    event.target.value === "" ? null : Number(event.target.value),
+                  )
+                }
                 type="number"
-                value={seed}
+                value={seed ?? ""}
               />
               <small>Для відтворюваної генерації</small>
             </label>
@@ -894,11 +1936,284 @@ export default function App() {
                 value={learningRate}
               />
             </label>
+            <label>
+              <span>Кількість прихованих шарів</span>
+              <select
+                onChange={(event) =>
+                  setHiddenLayers(Number(event.target.value) as 0 | 1)
+                }
+                value={hiddenLayers}
+              >
+                <option value="0">0 — лінійна модель</option>
+                <option value="1">1 — прихований шар</option>
+              </select>
+            </label>
+            {hiddenLayers === 1 && (
+              <label>
+                <span>Нейронів у прихованому шарі</span>
+                <input
+                  max="256"
+                  min="1"
+                  onChange={(event) => setHiddenUnits(Number(event.target.value))}
+                  type="number"
+                  value={hiddenUnits}
+                />
+                <small>Від 1 до 256 нейронів, активація sigmoid</small>
+              </label>
+            )}
+            <p className="field-hint">
+              {hiddenLayers === 1
+                ? `Input → Normalization → Dense(${hiddenUnits}, relu) → Dropout() → Dense(1, sigmoid)`
+                : "Input → Normalization → Dense(1, sigmoid)"}
+            </p>
           </div>
           <div className="modal-actions">
-            <button className="primary-button" onClick={() => setModal(null)}>
+            <button className="primary-button" onClick={saveTrainingSettings}>
               Зберегти налаштування
             </button>
+          </div>
+        </Modal>
+      )}
+
+      {modal === "model-details" && modelInfo && (
+        <Modal onClose={() => setModal(null)} title="Деталі моделі">
+          <div className="model-details">
+            <section className="details-section">
+              <div className="details-section-head">
+                <h3>Якість на тестовій вибірці</h3>
+                <span
+                  className={`compatibility-badge ${
+                    modelCompatible ? "ok" : "bad"
+                  }`}
+                >
+                  {modelCompatible ? "Сумісна" : "Несумісна"}
+                </span>
+              </div>
+              <div className="metric-grid">
+                <div className="metric-card">
+                  <span>Test accuracy</span>
+                  <strong>{formatPercent(modelMetrics?.test_accuracy)}</strong>
+                </div>
+                <div className="metric-card">
+                  <span>Balanced accuracy</span>
+                  <strong>
+                    {formatPercent(modelMetrics?.test_balanced_accuracy)}
+                  </strong>
+                </div>
+                <div className="metric-card">
+                  <span>Precision</span>
+                  <strong>{formatPercent(modelMetrics?.test_precision)}</strong>
+                </div>
+                <div className="metric-card">
+                  <span>Recall</span>
+                  <strong>{formatPercent(modelMetrics?.test_recall)}</strong>
+                </div>
+                <div className="metric-card">
+                  <span>F1</span>
+                  <strong>{formatPercent(modelMetrics?.test_f1)}</strong>
+                </div>
+                <div className="metric-card">
+                  <span>ROC AUC</span>
+                  <strong>{formatDecimal(modelMetrics?.test_roc_auc, 4)}</strong>
+                </div>
+              </div>
+            </section>
+
+            <section className="details-section">
+              <h3>Confusion matrix</h3>
+              {modelMetrics?.test_confusion_matrix ? (
+                <table className="confusion-matrix">
+                  <thead>
+                    <tr>
+                      <th />
+                      <th>Прогноз class0</th>
+                      <th>Прогноз class1</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <th>Факт class0</th>
+                      <td>{modelMetrics.test_confusion_matrix[0]?.[0] ?? "—"}</td>
+                      <td>{modelMetrics.test_confusion_matrix[0]?.[1] ?? "—"}</td>
+                    </tr>
+                    <tr>
+                      <th>Факт class1</th>
+                      <td>{modelMetrics.test_confusion_matrix[1]?.[0] ?? "—"}</td>
+                      <td>{modelMetrics.test_confusion_matrix[1]?.[1] ?? "—"}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              ) : (
+                <p className="field-hint">Матриця помилок недоступна.</p>
+              )}
+            </section>
+
+            <section className="details-section">
+              <h3>Метрики за класами</h3>
+              {modelMetrics?.per_class ? (
+                <table className="metrics-table">
+                  <thead>
+                    <tr>
+                      <th>Клас</th>
+                      <th>Precision</th>
+                      <th>Recall</th>
+                      <th>F1</th>
+                      <th>Support</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>class0</td>
+                      <td>{formatPercent(modelMetrics.per_class.class0.precision)}</td>
+                      <td>{formatPercent(modelMetrics.per_class.class0.recall)}</td>
+                      <td>{formatPercent(modelMetrics.per_class.class0.f1)}</td>
+                      <td>{modelMetrics.per_class.class0.support}</td>
+                    </tr>
+                    <tr>
+                      <td>class1</td>
+                      <td>{formatPercent(modelMetrics.per_class.class1.precision)}</td>
+                      <td>{formatPercent(modelMetrics.per_class.class1.recall)}</td>
+                      <td>{formatPercent(modelMetrics.per_class.class1.f1)}</td>
+                      <td>{modelMetrics.per_class.class1.support}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              ) : (
+                <p className="field-hint">Метрики за класами недоступні.</p>
+              )}
+            </section>
+
+            <section className="details-section">
+              <h3>Дані та навчання</h3>
+              <div className="details-grid">
+                <div>
+                  <span>Train / Test</span>
+                  <strong>
+                    {modelMetrics?.train_samples ?? "—"} /{" "}
+                    {modelMetrics?.test_samples ?? "—"}
+                  </strong>
+                </div>
+                <div>
+                  <span>Train / Test loss</span>
+                  <strong>
+                    {formatDecimal(modelMetrics?.train_loss)} /{" "}
+                    {formatDecimal(modelMetrics?.test_loss)}
+                  </strong>
+                </div>
+                <div>
+                  <span>Розподіл класів</span>
+                  <strong>
+                    class0 {modelMetrics?.class_distribution?.class0 ?? "—"} ·
+                    class1 {modelMetrics?.class_distribution?.class1 ?? "—"}
+                  </strong>
+                </div>
+                <div>
+                  <span>Class weights</span>
+                  <strong>
+                    class0 {formatDecimal(modelMetrics?.class_weights?.class0)} ·
+                    class1 {formatDecimal(modelMetrics?.class_weights?.class1)}
+                  </strong>
+                </div>
+                <div>
+                  <span>Епохи</span>
+                  <strong>{modelInfo.epochs}</strong>
+                </div>
+                <div>
+                  <span>Learning rate</span>
+                  <strong>{modelInfo.learning_rate}</strong>
+                </div>
+                <div>
+                  <span>Приховані шари</span>
+                  <strong>{modelInfo.hidden_layers ?? "—"}</strong>
+                </div>
+                <div>
+                  <span>Нейрони</span>
+                  <strong>{modelInfo.hidden_units ?? "—"}</strong>
+                </div>
+                <div>
+                  <span>Seed</span>
+                  <strong>{modelInfo.random_state ?? "—"}</strong>
+                </div>
+                <div>
+                  <span>Threshold</span>
+                  <strong>{formatDecimal(modelInfo.threshold, 2)}</strong>
+                </div>
+                <div>
+                  <span>Навчено</span>
+                  <strong>{formatDateTime(modelInfo.trained_at)}</strong>
+                </div>
+                <div>
+                  <span>Тривалість</span>
+                  <strong>
+                    {formatDecimal(
+                      modelMetrics?.duration_seconds ??
+                        modelInfo.duration_seconds,
+                      2,
+                    )}{" "}
+                    с
+                  </strong>
+                </div>
+                <div>
+                  <span>Джерело</span>
+                  <strong>{formatModelSource(modelInfo.source)}</strong>
+                </div>
+                <div>
+                  <span>Архітектура</span>
+                  <strong>{modelInfo.architecture || "—"}</strong>
+                </div>
+              </div>
+            </section>
+
+            <section className="details-section">
+              <h3>Сумісність із поточними налаштуваннями</h3>
+              <div
+                className={`compatibility ${
+                  modelCompatible ? "ok" : "bad"
+                }`}
+              >
+                <strong>
+                  {modelCompatible
+                    ? "Модель сумісна з поточними налаштуваннями."
+                    : "Модель несумісна з поточними налаштуваннями."}
+                </strong>
+                <table className="metrics-table compatibility-table">
+                  <thead>
+                    <tr>
+                      <th>Параметр</th>
+                      <th>Модель</th>
+                      <th>Поточні</th>
+                      <th>Статус</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>img_size</td>
+                      <td>{modelInfo.img_size}</td>
+                      <td>{imageSize}</td>
+                      <td>{modelInfo.img_size === imageSize ? "OK" : "Різниця"}</td>
+                    </tr>
+                    <tr>
+                      <td>grid_cells</td>
+                      <td>{modelInfo.grid_cells}</td>
+                      <td>{gridSize}</td>
+                      <td>
+                        {modelInfo.grid_cells === gridSize ? "OK" : "Різниця"}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>feature_count</td>
+                      <td>{modelInfo.feature_count}</td>
+                      <td>{currentFeatureCount}</td>
+                      <td>
+                        {modelInfo.feature_count === currentFeatureCount
+                          ? "OK"
+                          : "Різниця"}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </section>
           </div>
         </Modal>
       )}
@@ -912,6 +2227,28 @@ export default function App() {
             <button
               className="primary-button"
               onClick={() => downloadData(reference, "reference.png")}
+            >
+              <Icon name="download" /> Скачати PNG
+            </button>
+          </div>
+        </Modal>
+      )}
+
+      {modal === "source-grid" && sourceGridPreview && (
+        <Modal onClose={() => setModal(null)} title="Вхідне зображення із сіткою">
+          <div className="preview-modal">
+            <img
+              alt="Вхідне зображення із сіткою"
+              src={sourceGridPreview}
+            />
+          </div>
+          <div className="modal-actions spread">
+            <span>Сітка {gridSize}×{gridSize}</span>
+            <button
+              className="primary-button"
+              onClick={() =>
+                downloadData(sourceGridPreview, "source_with_grid.png")
+              }
             >
               <Icon name="download" /> Скачати PNG
             </button>
